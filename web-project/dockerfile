@@ -1,0 +1,29 @@
+# Stage 1: Build stage
+FROM python:3.13-slim
+
+WORKDIR /app
+
+# Copy requirements
+COPY requirements.txt .
+
+# Create a virtual environment
+RUN python3 -m venv /app/venv
+
+# Install dependencies into the virtual environment
+RUN /app/venv/bin/pip install --no-cache-dir -r requirements.txt
+
+# Copy app files
+COPY API_weather.py backend.py /app/
+COPY templates /app/templates
+
+# Create user and change ownership
+RUN adduser --disabled-password --no-create-home --gecos '' myuser \
+    && chown -R myuser /app
+
+# Switch to non-root user
+USER myuser
+
+EXPOSE 8000
+
+# Run Gunicorn using the virtual environment
+CMD ["/app/venv/bin/gunicorn", "--bind", "0.0.0.0:8000", "backend:app"]

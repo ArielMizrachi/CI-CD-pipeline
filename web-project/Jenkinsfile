@@ -1,0 +1,223 @@
+pipeline {
+    agent { label 'agent1' }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                script {
+                    // get the files from the repo that triggred the pipline
+                    checkout scm
+
+                    // create the tag for the image
+                    echo "GIT_COMMIT = '${env.GIT_COMMIT}'"
+                    echo "BUILD_NUMBER = '${env.BUILD_NUMBER}'"
+                    env.TAG = "${env.BUILD_NUMBER}_${env.GIT_COMMIT?.take(7) ?: 'unknown'}"
+                    echo "Generated TAG: ${env.TAG}"
+                }
+            }
+        }
+        stage('static test') {
+            steps {
+                echo "Running pylint...."
+                sh '''
+                    # create venv and install pylint
+                    python3 -m venv venv
+                    . venv/bin/activate
+                    pip install pylint
+
+                    # run pylint only on API_weather.py and backend.py
+                    pylint backend.py > pylint_report.txt || true
+
+                    # extract scores from the report (get the score and then seperate it be ' ')
+                    SCORES=$(grep "Your code has been rated at" pylint_report.txt | awk '{print $7}' | cut -d'/' -f1)
+
+                    for score in $SCORES; do
+                        SCORE_NUM=$(echo $score | cut -d'.' -f1)
+                        if [ "$SCORE_NUM" -lt 1 ]; then
+                            echo "pylint failed. The score was ${score}"
+                            exit 1
+                        fi
+                    done
+
+                    echo "Pylint test passed"
+
+                '''
+            }
+        }
+        stage('dependency scan') {
+            steps {
+                echo "Scanning dependencies for vulnerabilities..."
+                sh '''
+                    # activate the existing virtualenv
+                    . venv/bin/activate
+
+                    # install safety
+                    pip install safety
+
+                    # run safety check
+                    safety check --full-report --file=requirements.txt --exit-code 1 > safety_report.txt || SAFETY_EXIT=$?
+
+                    # check the exit code from safety
+                    if [ "$SAFETY_EXIT" -ne 0 ]; then
+                        echo "🔴 Vulnerabilities detected!"
+                        # Check if there are CRITICAL ones
+                        if grep -i "critical" safety_report.txt; then
+                            echo "❌ Critical vulnerability found! Failing the pipeline."
+                            exit 1
+                        else
+                            echo "⚠️ Vulnerabilities found but none are critical. Continuing."
+                        fi
+                    else
+                        echo "✅ No vulnerabilities found."
+                    fi
+                '''
+            }
+        }
+        stage('build'){
+            steps{
+                echo "turning into an image....."
+                sh '''
+                    # build Docker image using the Dockerfile in the current workspace
+                    docker build -t weather_app:latest .
+
+                    # remove the brance if it's runing (that have that name)
+                    docker rm -f weather_app_container 2>/dev/null || true
+                    docker run -d --name weather_app_container -p 8000:8000 weather_app:latest
+                '''
+                echo "image was created"    
+            }
+        } 
+        stage('docker scan') {
+            steps {
+                echo "Scanning Docker image for vulnerabilities..."
+                sh '''
+                    # Install Trivy (if not already installed)
+                    if ! command -v trivy &> /dev/null; then
+                    wget https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh -O install-trivy.sh
+                    chmod +x install-trivy.sh
+                    ./install-trivy.sh
+                    fi
+
+                '''
+                script {
+                    def status = sh(script: '''
+                        export PATH=$PATH:./bin
+                        trivy image --severity CRITICAL,HIGH --exit-code 1 --no-progress -f table -o trivy_report.txt weather_app:latest
+                        ''', returnStatus: true)
+
+                    if (status == 1) {
+                        echo "⚠️ Vulnerabilities found! Check above report."
+                        // sh 'cat trivy_report.txt'
+                    }
+                    else {
+                        echo "✅ No critical or high vulnerabilities found."
+                    }
+                }
+            }
+        }          
+        stage('test') {
+            steps {
+                sh '''
+                    echo "Testing container connection..."
+                    sleep 10
+                    for i in {1..5}; do
+                        echo "Trying to reach the app (attempt $i)..."
+                        curl -s http://localhost:8000 && echo "connection was established!" && exit 0
+                        sleep 2
+                        done
+
+                    echo "App did not respond in time"
+                    exit 1 
+                '''
+            }     
+        }
+        stage('publish') {
+            when {
+                    branch 'main'  // this stage runs only for the 'main' branch!
+                }
+            steps {
+                    // getting the credentials from jenkins
+                    withCredentials([usernamePassword(
+                    credentialsId: 'dockerhub', 
+                    usernameVariable: 'DOCKER_USER', 
+                    passwordVariable: 'DOCKER_PAT'
+                    )]) {
+                    sh """
+                        echo "Pushing to dockerhub...." 
+                        echo "\$DOCKER_PAT" | docker login -u "\$DOCKER_USER" --password-stdin
+
+                        docker tag weather_app:latest \$DOCKER_USER/weather_app:${env.TAG}
+                        docker tag weather_app:latest \$DOCKER_USER/weather_app:latest
+
+                        docker push \$DOCKER_USER/weather_app:${env.TAG}
+                        docker push \$DOCKER_USER/weather_app:latest
+                        
+                        echo "publish done"
+                    """
+                    } 
+            }     
+        }      
+        stage('clone deployment repository') {
+            when {
+                    branch 'main'  
+                }            
+            steps {
+                    echo "pulling repository"
+                    dir('gitops_dir') {
+                        git branch: 'main',
+                            url: "http://my-little-domain.com/ariel/argo_deployment.git",
+                            credentialsId: 'git-lab-token'
+                        sh 'ls -la'
+                    echo "pulling completed"    
+                    }
+                }     
+        }
+        stage('modify yaml with yq') {
+            when {
+                    branch 'main'  
+                }            
+            steps {
+                    echo "starting editing"
+                    dir('gitops_dir') {
+                    withEnv(["TAG=${env.TAG}"]) {
+                        sh """
+                        # install yq on the agent
+                        sudo wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq
+                        sudo chmod +x /usr/local/bin/yq
+
+                        # edit the tag in the yaml file
+                        yq e '.image.tag = strenv(TAG)' -i helm_script/values.yaml
+                        cat helm_script/values.yaml
+                        """
+                        }
+                    echo "modification over"    
+                    }
+                }
+        }
+        stage('Push changes') {
+            steps {
+                dir('gitops_dir') {
+                    withCredentials([usernamePassword(
+                        credentialsId: 'gitlab-user',
+                        usernameVariable: 'GIT_USER', 
+                        passwordVariable: 'GIT_TOKEN')]) {
+                        sh """
+                            git add helm_script/values.yaml
+                            git commit -m "Update image tag to ${env.TAG}"
+
+                            # Push using HTTPS with token
+                            git push http://${GIT_USER}:${GIT_TOKEN}@my-little-domain.com/ariel/argo_deployment.git main
+                        """
+                    }
+                }
+            }
+        }                                                     
+    }
+        post {
+            always {
+                // cleans the workspace!
+                echo 'cleaning up...'
+                deleteDir()  
+        }
+    }   
+}    

@@ -1,0 +1,11 @@
+replicaCount: 2
+image:
+  repository: arielmizrachi/weather_app
+  tag: 50_9d44cc6
+  pullPolicy: IfNotPresent
+containerPort: 8000
+service:
+  port: 80
+ingress:
+  enabled: true
+  host: a6740250787f346288c8e2cdef6cbfc8-836d1b397db5a48a.elb.us-east-1.amazonaws.com
